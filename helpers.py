@@ -5,11 +5,34 @@ from transformers import Trainer, EvalPrediction
 from transformers.trainer_utils import PredictionOutput
 from typing import Tuple
 from tqdm.auto import tqdm
+from numba import jit, cuda
+
+# import transformations, contraints, and the Augmenter
+from textattack.transformations import WordSwapChangeLocation
+from textattack.transformations import WordSwapChangeName
+from textattack.transformations import WordSwapChangeNumber
+from textattack.transformations import WordSwapContract
+from textattack.transformations import WordSwapExtend
+from textattack.transformations import CompositeTransformation
+
+from textattack.augmentation import EmbeddingAugmenter
+
+from textattack.constraints.pre_transformation import RepeatModification
+from textattack.constraints.pre_transformation import StopwordModification
+
+from textattack.augmentation import Augmenter
 
 QA_MAX_ANSWER_LENGTH = 30
 
 
+def augment_context(context):
+    context = augmenter.augment_many(
+        context, show_progress=True)
+    return context
+
 # This function preprocesses an NLI dataset, tokenizing premises and hypotheses.
+
+
 def prepare_dataset_nli(examples, tokenizer, max_seq_length=None):
     max_seq_length = tokenizer.model_max_length if max_seq_length is None else max_seq_length
 
@@ -40,14 +63,21 @@ def compute_accuracy(eval_preds: EvalPrediction):
 # and finding the right offsets for the answer spans in the tokenized context (to use as labels).
 # Adapted from https://github.com/huggingface/transformers/blob/master/examples/pytorch/question-answering/run_qa.py
 def prepare_train_dataset_qa(examples, tokenizer, max_seq_length=None):
+    augmenter = EmbeddingAugmenter()
+
     questions = [q.lstrip() for q in examples["question"]]
     max_seq_length = tokenizer.model_max_length
+    context = examples["context"]
+
+    context = list(map(''.join, augmenter.augment_many(
+        examples["context"], show_progress=True)))
     # tokenize both questions and the corresponding context
     # if the context length is longer than max_length, we split it to several
     # chunks of max_length
+
     tokenized_examples = tokenizer(
         questions,
-        examples["context"],
+        context,
         truncation="only_second",
         max_length=max_seq_length,
         stride=min(max_seq_length // 2, 128),
@@ -116,7 +146,11 @@ def prepare_train_dataset_qa(examples, tokenizer, max_seq_length=None):
 
 
 def prepare_validation_dataset_qa(examples, tokenizer):
+    # examples = examples['data'][0][0]['paragraphs'][0]['qas'][0]
+    # print(examples)
     questions = [q.lstrip() for q in examples["question"]]
+    # print(questions[:10])
+    # print(examples["context"])
     max_seq_length = tokenizer.model_max_length
     tokenized_examples = tokenizer(
         questions,
@@ -200,9 +234,9 @@ def postprocess_qa_predictions(examples,
 
             # Go through all possibilities for the `n_best_size` greater start and end logits.
             start_indexes = np.argsort(start_logits)[
-                            -1: -n_best_size - 1: -1].tolist()
+                -1: -n_best_size - 1: -1].tolist()
             end_indexes = np.argsort(end_logits)[
-                          -1: -n_best_size - 1: -1].tolist()
+                -1: -n_best_size - 1: -1].tolist()
             for start_index in start_indexes:
                 for end_index in end_indexes:
                     # Don't consider out-of-scope answers, either because the indices are out of bounds or correspond
@@ -219,12 +253,17 @@ def postprocess_qa_predictions(examples,
                             end_index - start_index + 1 > QA_MAX_ANSWER_LENGTH:
                         continue
 
+                    try:
+                        prediction_offsets = (
+                            offset_mapping[start_index][0], offset_mapping[end_index][1])
+                    except IndexError:
+                        continue
+
                     prelim_predictions.append(
                         {
-                            "offsets": (offset_mapping[start_index][0],
-                                        offset_mapping[end_index][1]),
+                            "offsets": prediction_offsets,
                             "score": start_logits[start_index] +
-                                     end_logits[end_index],
+                            end_logits[end_index],
                             "start_logit": start_logits[start_index],
                             "end_logit": end_logits[end_index],
                         }
